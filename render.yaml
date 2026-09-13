@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: wallet-service
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: wallet-service-postgres
+          property: connectionString
+      - key: LOG_LEVEL
+        value: info
+      - key: ADMIN_TOKEN
+        generateValue: true
+
+databases:
+  - name: wallet-service-postgres
+    plan: free
+    databaseName: wallet
+    user: wallet
