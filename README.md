@@ -41,6 +41,24 @@ BASE_URL=https://your-render-url ADMIN_TOKEN=your-admin-token bash scripts/burst
 
 The script covers concurrent get-or-create, idempotent retry storms, same-key different-body conflict, and conservation under contention.
 
+## Live Deployment
+
+- API URL: `https://wallet-service-re06.onrender.com`
+- Public repo: `https://github.com/ashish2705/wallet-service`
+- Render service dashboard/logs: `https://dashboard.render.com/web/srv-dajdn9vqj5pc73d7jnq0`
+
+Run the burst probe against the deployed service:
+
+```sh
+BASE_URL=https://wallet-service-re06.onrender.com ADMIN_TOKEN=<render-admin-token> bash scripts/burst.sh
+```
+
+View recent structured logs with the Render CLI:
+
+```sh
+render2 logs --resources srv-dajdn9vqj5pc73d7jnq0 --limit 50
+```
+
 ## Render Deployment
 
 The repository includes `render.yaml` for Render Blueprint deployment:
@@ -51,4 +69,4 @@ The repository includes `render.yaml` for Render Blueprint deployment:
 4. After deployment, verify `/healthz` and `/metrics`.
 5. Run `BASE_URL=https://your-render-url bash scripts/smoke.sh`.
 
-Free-tier note: Render free web services can spin down after idle time, and free Render Postgres databases expire after 30 days.
+Free-tier note: Render free web services can spin down after idle time, and free Render Postgres databases expire after 30 days. This database expires on 2026-10-13.
