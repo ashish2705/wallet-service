@@ -1,5 +1,12 @@
 # Wallet Transfer Write-Up
 
+## Submission Links
+
+- Live API: `https://wallet-service-re06.onrender.com`
+- Public repo: `https://github.com/ashish2705/wallet-service`
+- Burst script: `BASE_URL=https://wallet-service-re06.onrender.com ADMIN_TOKEN=<render-admin-token> bash scripts/burst.sh`
+- Logs: Render service `srv-dajdn9vqj5pc73d7jnq0`, view with `render2 logs --resources srv-dajdn9vqj5pc73d7jnq0 --tail` or from the Render dashboard.
+
 ## Data Model
 
 The service stores wallets in Postgres with a UUID primary key, a unique `user_id`, and integer `balance_paise` guarded by `check (balance_paise >= 0)`. Transfers are stored with a UUID primary key, unique `idempotency_key`, request hash, source/destination wallet ids, integer `amount_paise`, and status.
@@ -24,4 +31,4 @@ Logs are structured JSON with `correlation_id`. Domain events include wallet get
 
 ## AI Disclosure And Cost
 
-I directed the phased approach, deployment target, and correctness choices from the exercise/rubric. AI helped type the service scaffold, Docker/Compose setup, scripts, and documentation under those constraints. Free-tier cost target is ₹0 using Render Free Web Service and Render Free Postgres. Render free services can spin down when idle, and this Render free Postgres database expires on 2026-10-13.
+Directed by me: phased delivery, Render deployment target, Postgres-backed correctness, sorted row locks, same-transaction idempotency, and admin seeding for probes. AI assisted with typing the Fastify service, Docker/Compose setup, scripts, and documentation under those constraints. I did not delegate the core money-movement correctness decisions to AI. Free-tier cost target is ₹0 using Render Free Web Service and Render Free Postgres. Render free services can spin down when idle, and this Render free Postgres database expires on 2026-10-13.
