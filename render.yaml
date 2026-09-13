@@ -4,6 +4,10 @@ services:
     runtime: docker
     plan: free
     healthCheckPath: /healthz
+    buildFilter:
+      ignoredPaths:
+        - "**/*.md"
+        - "docs/**"
     envVars:
       - key: DATABASE_URL
         fromDatabase:
