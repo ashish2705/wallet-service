@@ -1,8 +1,8 @@
 # Wallet Service
 
-Phase 1 skeleton for the Paytm PML wallet transfer exercise.
+Wallet and P2P transfer API for the Paytm PML wallet transfer exercise.
 
-This phase exposes the final API routes with schema-compatible stub responses, plus real operational plumbing: Docker, Postgres health, structured JSON logs, correlation IDs, and Prometheus metrics. Phase 2 will replace the stub internals with transactional wallet and transfer logic.
+The service is intentionally API-only. It uses Postgres transactions, deterministic row locks, database uniqueness constraints, structured JSON logs, correlation IDs, and Prometheus metrics.
 
 ## Local Run
 
@@ -19,12 +19,27 @@ bash scripts/smoke.sh
 
 ## Phase 1 API Surface
 
-- `POST /wallets` returns a deterministic stub wallet for the bearer token.
-- `GET /wallets/:id` returns a stub zero balance.
-- `POST /transfers` validates the request shape and returns a deterministic stub transfer.
-- `GET /transfers/:id` returns a stub transfer status.
+- `POST /wallets` get-or-creates a wallet for the bearer token.
+- `GET /wallets/:id` returns the current balance.
+- `POST /transfers` moves integer paise between wallets using an idempotency key.
+- `GET /transfers/:id` returns persisted transfer status.
+- `POST /admin/seed` sets up funded test wallets when called with `X-Admin-Token`.
 - `GET /healthz` verifies the service and database connection.
 - `GET /metrics` exposes Prometheus metrics.
+
+## Burst Probe
+
+```sh
+ADMIN_TOKEN=dev-admin-token bash scripts/burst.sh
+```
+
+Against a deployed service:
+
+```sh
+BASE_URL=https://your-render-url ADMIN_TOKEN=your-admin-token bash scripts/burst.sh
+```
+
+The script covers concurrent get-or-create, idempotent retry storms, same-key different-body conflict, and conservation under contention.
 
 ## Render Deployment
 

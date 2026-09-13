@@ -3,7 +3,13 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import type pg from "pg";
 import { loadConfig, type AppConfig } from "./config.js";
 import { checkDatabase, createPool } from "./db.js";
-import { installMetricsHooks, register, transfersCreatedTotal } from "./metrics.js";
+import {
+  idempotentReplaysTotal,
+  installMetricsHooks,
+  register,
+  transfersCreatedTotal,
+  transfersDeclinedInsufficientFundsTotal
+} from "./metrics.js";
 
 type CreateWalletReply = {
   wallet_id: string;
@@ -32,9 +38,70 @@ type TransferReply = {
   status: "succeeded" | "declined_insufficient_funds" | "pending";
 };
 
-function stableId(prefix: string, value: string): string {
-  const hash = crypto.createHash("sha256").update(value).digest("hex").slice(0, 24);
-  return `${prefix}_${hash}`;
+type AdminSeedBody = {
+  user_id: string;
+  balance_paise: number;
+};
+
+type WalletRow = {
+  id: string;
+  user_id: string;
+  balance_paise: string;
+};
+
+type TransferRow = {
+  id: string;
+  idempotency_key: string;
+  request_hash: string;
+  from_wallet_id: string;
+  to_wallet_id: string;
+  amount_paise: string;
+  status: TransferReply["status"];
+};
+
+type TransferWithWalletsRow = TransferRow & {
+  from_wallet_id: string;
+  to_wallet_id: string;
+};
+
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && uuidPattern.test(value);
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function toSafeNumber(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`unsafe integer from database: ${value}`);
+  }
+  return parsed;
+}
+
+function transferRequestHash(body: CreateTransferBody): string {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ from: body.from, to: body.to, amount_paise: body.amount_paise }))
+    .digest("hex");
+}
+
+function transferReply(row: TransferWithWalletsRow): TransferReply {
+  return {
+    transfer_id: row.id,
+    from: row.from_wallet_id,
+    to: row.to_wallet_id,
+    amount_paise: toSafeNumber(row.amount_paise),
+    idempotency_key: row.idempotency_key,
+    status: row.status
+  };
 }
 
 function readBearerToken(request: FastifyRequest): string | null {
@@ -77,7 +144,7 @@ function buildServer(config: AppConfig, pool: pg.Pool): FastifyInstance {
   installMetricsHooks(app);
 
   app.addHook("preHandler", async (request, reply) => {
-    if (request.url === "/healthz" || request.url === "/metrics") {
+    if (request.url === "/healthz" || request.url === "/metrics" || request.url === "/admin/seed") {
       return;
     }
 
@@ -99,74 +166,269 @@ function buildServer(config: AppConfig, pool: pg.Pool): FastifyInstance {
     return register.metrics();
   });
 
-  app.post("/wallets", async (request, _reply): Promise<CreateWalletReply> => {
+  app.post("/wallets", async (request): Promise<CreateWalletReply> => {
     const userId = request.userId ?? "anonymous";
-    const walletId = stableId("wallet", userId);
+    const result = await pool.query<WalletRow>(
+      `
+        insert into wallets (user_id)
+        values ($1)
+        on conflict (user_id) do update
+          set updated_at = wallets.updated_at
+        returning id, user_id, balance_paise
+      `,
+      [userId]
+    );
+    const wallet = result.rows[0];
 
-    request.log.info({ event: "wallet.stub_returned", user_id: userId, wallet_id: walletId }, "wallet stub returned");
+    request.log.info({ event: "wallet.get_or_create", user_id: userId, wallet_id: wallet.id }, "wallet returned");
 
     return {
-      wallet_id: walletId,
-      user_id: userId,
-      balance_paise: 0
+      wallet_id: wallet.id,
+      user_id: wallet.user_id,
+      balance_paise: toSafeNumber(wallet.balance_paise)
     };
   });
 
-  app.get<{ Params: { id: string } }>("/wallets/:id", async (request): Promise<WalletReply> => {
+  app.get<{ Params: { id: string } }>("/wallets/:id", async (request, reply): Promise<WalletReply> => {
     const walletId = request.params.id;
 
-    request.log.info({ event: "wallet.balance_stub_returned", wallet_id: walletId }, "wallet balance stub returned");
+    if (!isUuid(walletId)) {
+      return reply.code(400).send({ error: "invalid_wallet_id" }) as never;
+    }
+
+    const result = await pool.query<WalletRow>("select id, user_id, balance_paise from wallets where id = $1", [walletId]);
+    const wallet = result.rows[0];
+
+    if (!wallet) {
+      return reply.code(404).send({ error: "wallet_not_found" }) as never;
+    }
+
+    request.log.info({ event: "wallet.balance_read", wallet_id: walletId }, "wallet balance returned");
 
     return {
-      wallet_id: walletId,
-      balance_paise: 0
+      wallet_id: wallet.id,
+      balance_paise: toSafeNumber(wallet.balance_paise)
     };
   });
 
   app.post<{ Body: CreateTransferBody }>("/transfers", async (request, reply): Promise<TransferReply> => {
     const body = request.body;
 
-    if (!body?.from || !body.to || !body.idempotency_key || !Number.isInteger(body.amount_paise) || body.amount_paise <= 0) {
+    if (
+      !body ||
+      !isUuid(body.from) ||
+      !isUuid(body.to) ||
+      body.from === body.to ||
+      typeof body.idempotency_key !== "string" ||
+      body.idempotency_key.length === 0 ||
+      !isPositiveInteger(body.amount_paise)
+    ) {
       return reply.code(400).send({ error: "invalid_transfer_request" }) as never;
     }
 
-    const transferId = stableId("transfer", body.idempotency_key);
-    transfersCreatedTotal.inc();
+    const requestHash = transferRequestHash(body);
+    const client = await pool.connect();
+
+    try {
+      await client.query("begin");
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [body.idempotency_key]);
+
+      const existing = await client.query<TransferWithWalletsRow>(
+        `
+          select id, idempotency_key, request_hash, from_wallet_id, to_wallet_id, amount_paise, status
+          from transfers
+          where idempotency_key = $1
+        `,
+        [body.idempotency_key]
+      );
+
+      if (existing.rows[0]) {
+        if (existing.rows[0].request_hash !== requestHash) {
+          await client.query("rollback");
+          request.log.warn(
+            { event: "transfer.idempotency_conflict", idempotency_key: body.idempotency_key },
+            "idempotency key replayed with different body"
+          );
+          return reply.code(409).send({ error: "idempotency_key_conflict" }) as never;
+        }
+
+        await client.query("commit");
+        idempotentReplaysTotal.inc();
+        request.log.info(
+          {
+            event: "transfer.idempotent_replay_hit",
+            transfer_id: existing.rows[0].id,
+            idempotency_key: body.idempotency_key
+          },
+          "idempotent transfer replay returned"
+        );
+        return transferReply(existing.rows[0]);
+      }
+
+      const wallets = await client.query<WalletRow>(
+        `
+          select id, user_id, balance_paise
+          from wallets
+          where id = any($1::uuid[])
+          order by id
+          for update
+        `,
+        [[body.from, body.to]]
+      );
+
+      if (wallets.rows.length !== 2) {
+        await client.query("rollback");
+        return reply.code(404).send({ error: "wallet_not_found" }) as never;
+      }
+
+      const fromWallet = wallets.rows.find((wallet) => wallet.id === body.from);
+      const toWallet = wallets.rows.find((wallet) => wallet.id === body.to);
+
+      if (!fromWallet || !toWallet) {
+        await client.query("rollback");
+        return reply.code(404).send({ error: "wallet_not_found" }) as never;
+      }
+
+      const fromBalance = toSafeNumber(fromWallet.balance_paise);
+      const status: TransferReply["status"] =
+        fromBalance >= body.amount_paise ? "succeeded" : "declined_insufficient_funds";
+
+      if (status === "succeeded") {
+        await client.query("update wallets set balance_paise = balance_paise - $1, updated_at = now() where id = $2", [
+          body.amount_paise,
+          body.from
+        ]);
+        request.log.info(
+          { event: "transfer.debited", from: body.from, amount_paise: body.amount_paise },
+          "wallet debited"
+        );
+
+        await client.query("update wallets set balance_paise = balance_paise + $1, updated_at = now() where id = $2", [
+          body.amount_paise,
+          body.to
+        ]);
+        request.log.info(
+          { event: "transfer.credited", to: body.to, amount_paise: body.amount_paise },
+          "wallet credited"
+        );
+      }
+
+      const created = await client.query<TransferWithWalletsRow>(
+        `
+          insert into transfers (
+            idempotency_key,
+            request_hash,
+            from_wallet_id,
+            to_wallet_id,
+            amount_paise,
+            status
+          )
+          values ($1, $2, $3, $4, $5, $6)
+          returning id, idempotency_key, request_hash, from_wallet_id, to_wallet_id, amount_paise, status
+        `,
+        [body.idempotency_key, requestHash, body.from, body.to, body.amount_paise, status]
+      );
+
+      await client.query("commit");
+
+      transfersCreatedTotal.inc();
+      request.log.info(
+        {
+          event: "transfer.created",
+          transfer_id: created.rows[0].id,
+          from: body.from,
+          to: body.to,
+          amount_paise: body.amount_paise,
+          idempotency_key: body.idempotency_key,
+          status
+        },
+        "transfer created"
+      );
+
+      if (status === "declined_insufficient_funds") {
+        transfersDeclinedInsufficientFundsTotal.inc();
+        request.log.info(
+          {
+            event: "transfer.declined",
+            reason: "insufficient_funds",
+            transfer_id: created.rows[0].id,
+            from: body.from,
+            to: body.to,
+            amount_paise: body.amount_paise,
+            idempotency_key: body.idempotency_key
+          },
+          "transfer declined"
+        );
+      }
+
+      return transferReply(created.rows[0]);
+    } catch (error) {
+      await client.query("rollback").catch(() => undefined);
+      request.log.error({ err: error, event: "transfer.failed" }, "transfer failed");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get<{ Params: { id: string } }>("/transfers/:id", async (request, reply): Promise<TransferReply> => {
+    const transferId = request.params.id;
+
+    if (!isUuid(transferId)) {
+      return reply.code(400).send({ error: "invalid_transfer_id" }) as never;
+    }
+
+    const result = await pool.query<TransferWithWalletsRow>(
+      `
+        select id, idempotency_key, request_hash, from_wallet_id, to_wallet_id, amount_paise, status
+        from transfers
+        where id = $1
+      `,
+      [transferId]
+    );
+    const transfer = result.rows[0];
+
+    if (!transfer) {
+      return reply.code(404).send({ error: "transfer_not_found" }) as never;
+    }
+
+    request.log.info({ event: "transfer.status_read", transfer_id: transferId }, "transfer status returned");
+
+    return transferReply(transfer);
+  });
+
+  app.post<{ Body: AdminSeedBody }>("/admin/seed", async (request, reply): Promise<CreateWalletReply> => {
+    if (request.headers["x-admin-token"] !== config.adminToken) {
+      return reply.code(401).send({ error: "invalid_admin_token" }) as never;
+    }
+
+    const body = request.body;
+    if (!body || typeof body.user_id !== "string" || body.user_id.length === 0 || !isNonNegativeInteger(body.balance_paise)) {
+      return reply.code(400).send({ error: "invalid_seed_request" }) as never;
+    }
+
+    const result = await pool.query<WalletRow>(
+      `
+        insert into wallets (user_id, balance_paise)
+        values ($1, $2)
+        on conflict (user_id) do update
+          set balance_paise = excluded.balance_paise,
+              updated_at = now()
+        returning id, user_id, balance_paise
+      `,
+      [body.user_id, body.balance_paise]
+    );
+    const wallet = result.rows[0];
 
     request.log.info(
-      {
-        event: "transfer.stub_created",
-        transfer_id: transferId,
-        from: body.from,
-        to: body.to,
-        amount_paise: body.amount_paise,
-        idempotency_key: body.idempotency_key
-      },
-      "transfer stub created"
+      { event: "wallet.admin_seeded", user_id: wallet.user_id, wallet_id: wallet.id, balance_paise: body.balance_paise },
+      "wallet seeded"
     );
 
     return {
-      transfer_id: transferId,
-      from: body.from,
-      to: body.to,
-      amount_paise: body.amount_paise,
-      idempotency_key: body.idempotency_key,
-      status: "succeeded"
-    };
-  });
-
-  app.get<{ Params: { id: string } }>("/transfers/:id", async (request): Promise<TransferReply> => {
-    const transferId = request.params.id;
-
-    request.log.info({ event: "transfer.status_stub_returned", transfer_id: transferId }, "transfer status stub returned");
-
-    return {
-      transfer_id: transferId,
-      from: "wallet_stub_from",
-      to: "wallet_stub_to",
-      amount_paise: 1,
-      idempotency_key: stableId("idempotency", transferId),
-      status: "pending"
+      wallet_id: wallet.id,
+      user_id: wallet.user_id,
+      balance_paise: toSafeNumber(wallet.balance_paise)
     };
   });
 
